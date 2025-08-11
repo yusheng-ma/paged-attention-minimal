@@ -101,7 +101,7 @@ def forward(tokens, start_pos):
     return tokens
 
 # Load ShareGPT prompts
-with open('sharegpt-filtered.json') as f:
+with open('my-sharegpt-filtered.json') as f:
     sharegpt = json.load(f)
 
 requests = []

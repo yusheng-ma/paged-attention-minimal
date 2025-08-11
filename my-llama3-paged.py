@@ -84,6 +84,7 @@ def forward(tokens, start_pos):
 
         # Use KV Cache Manager to get paged_kv_cache and (logical) block table
         block_table = cms[layer].get_block_table()
+        print(f"{start_pos}, {layer}: {block_table}")
         k_cache_paged, v_cache_paged = cms[layer].get_kv_cache()
         cache_seqlens = torch.where(eos_reached, cms[layer].get_last_pos(), torch.tensor([start_pos]*bsz, dtype=torch.int32, device=device))
         y = flash_attn_with_kvcache(q, k_cache_paged, v_cache_paged, k, v, cache_seqlens=cache_seqlens, block_table=block_table, causal=True)
@@ -105,7 +106,7 @@ def forward(tokens, start_pos):
     return tokens
 
 # Load ShareGPT prompts
-with open('sharegpt-filtered.json') as f:
+with open('my-sharegpt-filtered.json') as f:
     sharegpt = json.load(f)
 
 requests = []
@@ -163,8 +164,8 @@ class CacheManager:
     def get_free_block(self):
         if len(self.free_blocks) == 0:
             raise Exception('No more free blocks. Implement scheduling and preemption.')
-        index = random.choice(list(self.free_blocks))
-        # index = min(self.free_blocks)
+        # index = random.choice(list(self.free_blocks))
+        index = min(self.free_blocks)  # smallest free block
         self.free_blocks.remove(index)
         return index
 
@@ -225,7 +226,9 @@ class CacheManager:
 cms = [CacheManager(tokens) for _ in range(n_layers)]
 
 # Do inference
-for cur_pos in range(min_prompt_len, max_seq_len):
+forward_time = max_seq_len
+# for cur_pos in range(min_prompt_len, max_seq_len):
+for cur_pos in range(min_prompt_len, min_prompt_len + forward_time):
     next_token = forward(tokens[:,prev_pos:cur_pos], prev_pos)
     next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
     tokens[:, cur_pos] = next_token
@@ -243,7 +246,8 @@ for cur_pos in range(min_prompt_len, max_seq_len):
 # Print generated answers
 for i, toks in enumerate(tokens.tolist()):
     start = 0 if False else len(prompt_tokens[i])
-    toks = toks[start: len(prompt_tokens[i]) + max_seq_len]
+    # toks = toks[start: len(prompt_tokens[i]) + max_seq_len]
+    toks = toks[start: len(prompt_tokens[i]) + forward_time]
     for stop_token in tokenizer.stop_tokens:
         try:
             eos_idx = toks.index(stop_token)
