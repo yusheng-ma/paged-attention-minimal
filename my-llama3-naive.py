@@ -14,12 +14,12 @@ model_name = 'Meta-Llama-3-8B-Instruct'
 tokenizer_path = f'{model_name}/original/tokenizer.model'
 tokenizer = Tokenizer(model_path=tokenizer_path)
 
-# 載入模型權重（suppress weights_only warning）
+# 載入模型權重
 model = torch.load(
     f'{model_name}/original/consolidated.00.pth',
     map_location=device,
     mmap=False,
-    weights_only=True  # 安全起見（若權重是純張量）
+    weights_only=False  # 若有 warning，可改 True；但若權重含 tensor 則需 False
 )
 
 with open(f'{model_name}/original/params.json', 'r') as f:
@@ -34,10 +34,10 @@ multiple_of = config['multiple_of']
 ffn_dim_multiplier = config['ffn_dim_multiplier']
 norm_eps = config['norm_eps']
 rope_theta = torch.tensor(config['rope_theta'], device=device)
-head_dim = dim // n_heads
+head_dim = dim // n_heads  # 128
 max_seq_len = 8192
 
-# stop_tokens 用來判斷是否結束
+# stop_tokens 用來判斷生成是否結束
 stop_tokens = torch.tensor(list(tokenizer.stop_tokens), device=device)
 
 # -----------------------------
@@ -48,8 +48,7 @@ embedding_layer = torch.nn.Embedding(vocab_size, dim, device=device, _weight=mod
 # -----------------------------
 # RoPE 頻率預計算
 # -----------------------------
-zero_to_one_split_into_64_parts = torch.arange(head_dim // 2, device=device) / (head_dim // 2)
-freqs = 1.0 / (rope_theta ** zero_to_one_split_into_64_parts)
+freqs = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
 freqs_for_each_token = torch.outer(torch.arange(max_seq_len, device=device), freqs)
 freqs_cis_max = torch.polar(torch.ones_like(freqs_for_each_token), freqs_for_each_token)  # (max_seq_len, head_dim//2)
 
@@ -72,14 +71,14 @@ def rms_norm(tensor, norm_weights):
     return (tensor * torch.rsqrt(tensor.pow(2).mean(-1, keepdim=True) + norm_eps)) * norm_weights
 
 # -----------------------------
-# 前向推理函數（支援 batch_size = 1）
+# 前向推理函數
 # -----------------------------
 def forward(tokens, start_pos):
     bsz, T = tokens.shape
-    assert bsz == 1, "This version assumes batch_size = 1"
+    assert bsz == 1, "Batch size must be 1"
 
     final_embedding = embedding_layer(tokens)
-    freqs_cis = freqs_cis_max[start_pos:start_pos+T]
+    freqs_cis = freqs_cis_max[start_pos:start_pos+T]  # (T, head_dim//2)
 
     for layer in range(n_layers):
         q_layer = model[f'layers.{layer}.attention.wq.weight']
@@ -99,6 +98,7 @@ def forward(tokens, start_pos):
 
         q, k = apply_rotary_emb(q, k, freqs_cis)
 
+        # 使用全局共享的 kv_cache（會被重用）
         k_cache, v_cache = kv_cache[layer]
         y = flash_attn_with_kvcache(
             q, k_cache, v_cache, k, v,
@@ -107,7 +107,7 @@ def forward(tokens, start_pos):
         )
         stacked_qkv_attention = y.view(bsz, T, dim)
 
-        embedding_delta = (stacked_qkv_attention @ w_layer.T)
+        embedding_delta = stacked_qkv_attention @ w_layer.T
         embedding_after_edit = final_embedding + embedding_delta
 
         ffn_norm = rms_norm(embedding_after_edit, model[f'layers.{layer}.ffn_norm.weight'])
@@ -121,14 +121,14 @@ def forward(tokens, start_pos):
         final_embedding = embedding_after_edit + output_after_feedforward
 
     final_embedding = rms_norm(final_embedding, model['norm.weight'])
-    logits = (final_embedding[:, -1, :] @ model['output.weight'].T)
+    logits = final_embedding[:, -1, :] @ model['output.weight'].T
     next_token = torch.argmax(logits, dim=-1)
     return next_token
 
 # -----------------------------
-# 主程式：逐條處理
+# 主程式：重用 KV Cache
 # -----------------------------
-# 讀取資料
+# 讀取 ShareGPT 數據
 with open('my-sharegpt-filtered.json', 'r', encoding='utf-8') as f:
     sharegpt = json.load(f)
 
@@ -139,38 +139,39 @@ for i in range(num_requests):
     if len(convs) > 0:
         requests.append({'role': 'user', 'content': convs[0]['value']})
 
+# 🔁 只創建一次 KV Cache（重複使用）
+kv_cache = [
+    (
+        torch.zeros((1, max_seq_len, n_kv_heads, head_dim), dtype=torch.bfloat16, device=device),
+        torch.zeros((1, max_seq_len, n_kv_heads, head_dim), dtype=torch.bfloat16, device=device)
+    )
+    for _ in range(n_layers)
+]
+
 total_fragmented_memory = 0
 
-print(f"開始處理 {num_requests} 個請求（batch size = 1）...\n")
+print(f"開始處理 {num_requests} 個請求（重用 KV Cache）...\n")
 
 for req_idx, dialog in enumerate(requests):
     print(f"[{req_idx+1}/{num_requests}] 處理中...")
 
-    # Tokenize
+    # Tokenize 對話
     prompt_tokens = ChatFormat(tokenizer).encode_dialog_prompt([dialog])
     prompt_len = len(prompt_tokens)
 
-    # 初始化輸入 (1, max_seq_len)
+    # 初始化 tokens (1, max_seq_len)
     tokens = torch.full((1, max_seq_len), tokenizer.pad_id, dtype=torch.long, device=device)
     tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
 
     input_text_mask = tokens != tokenizer.pad_id
     eos_reached = torch.tensor([False], device=device)
 
-    # 初始化 KV Cache（batch_size = 1）
-    kv_cache = [
-        (
-            torch.zeros((1, max_seq_len, n_kv_heads, head_dim), dtype=torch.bfloat16, device=device),
-            torch.zeros((1, max_seq_len, n_kv_heads, head_dim), dtype=torch.bfloat16, device=device)
-        )
-        for _ in range(n_layers)
-    ]
-
     generated_tokens = []
-    prev_pos = 0
+    prev_pos = 0  # 🔄 每次都從 0 開始，KV Cache 自動覆蓋舊資料
 
     # 自回歸生成
     for cur_pos in range(prompt_len, max_seq_len):
+        # 🔁 使用同一組 kv_cache，但從 prev_pos 開始寫入
         next_token = forward(tokens[:, prev_pos:cur_pos], prev_pos)
         next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[0, cur_pos] = next_token.item()
@@ -185,12 +186,12 @@ for req_idx, dialog in enumerate(requests):
         if eos_reached.item():
             break
 
-    # 解碼：只取生成部分（不含 prompt）
+    # 解碼生成結果（只取生成部分）
     start_idx = prompt_len
     end_idx = start_idx + len(generated_tokens)
     toks = tokens[0, start_idx:end_idx].tolist()
 
-    # 移除 stop token 之後的內容
+    # 移除 stop token 及之後內容
     cleaned_tokens = []
     for t in toks:
         if t in tokenizer.stop_tokens:
@@ -202,19 +203,21 @@ for req_idx, dialog in enumerate(requests):
     print("💬 回覆：", decoded)
     print("-" * 80)
 
-    # 計算碎片記憶體
+    # 計算此請求的記憶體碎片
     seq_len = prompt_len + len(cleaned_tokens)
     fragmented_slots = max_seq_len - seq_len
-    fragmented_memory = fragmented_slots * n_kv_heads * head_dim * 2 * 2 * n_layers  # 2 bytes per bfloat16
-    total_fragmented_memory += fragmented_memory
+    fragmented_memory_bytes = fragmented_slots * n_kv_heads * head_dim * 2 * 2 * n_layers  # bfloat16 = 2 bytes
+    total_fragmented_memory += fragmented_memory_bytes
 
     print(f"📊 [請求 {req_idx+1}] 生成長度: {len(cleaned_tokens)}, "
           f"總序列長度: {seq_len}, "
-          f"碎片: {fragmented_memory / 1e6:.2f} MB")
+          f"碎片記憶體: {fragmented_memory_bytes / 1e6:.2f} MB")
 
 # -----------------------------
 # 最終統計
 # -----------------------------
 total_gb = total_fragmented_memory / 1e9
 total_ratio = total_fragmented_memory / torch.cuda.get_device_properties(0).total_memory
-print(f"\n✅ 總碎片記憶體: {total_gb:.2f} GB ({total_ratio * 100:.2f}%)")
+
+print(f"\n✅ 完成 {num_requests} 個請求")
+print(f"💥 總碎片記憶體: {total_gb:.2f} GB ({total_ratio * 100:.2f}%)")
